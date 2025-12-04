@@ -1,17 +1,19 @@
-FROM python:3.10-slim
+FROM ubuntu:22.04
 
-# Install LibreOffice
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Install Python + LibreOffice
 RUN apt-get update && \
-    apt-get install -y libreoffice && \
+    apt-get install -y python3 python3-pip libreoffice && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
 EXPOSE 5000
 
-CMD ["python", "app.py"]
+CMD ["python3", "app.py"]
