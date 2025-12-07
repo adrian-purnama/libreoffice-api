@@ -1,19 +1,16 @@
-FROM ubuntu:22.04
+FROM debian:stable-slim
 
-ARG DEBIAN_FRONTEND=noninteractive
-
-# Install Python + LibreOffice
+# Install LibreOffice + Java
 RUN apt-get update && \
-    apt-get install -y python3 python3-pip libreoffice && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get install -y libreoffice default-jre python3 python3-pip && \
+    apt-get clean
 
+# Install Flask & dependencies
 WORKDIR /app
-
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+COPY . .
 
-EXPOSE 5000
-
-CMD ["python3", "app.py"]
+EXPOSE 3501
+CMD ["python3", "server.py"]
