@@ -14,7 +14,7 @@ API_PASSWORD = os.getenv("API_PASSWORD")  # Optional security
 
 @app.route("/")
 def index():
-    return "LibreOffice Flask API is running."
+    return "LibreOffice Flask API is running, This App is created by Adrian, a part of AMFPHUB"
 
 
 def allowed_ext(filename):
