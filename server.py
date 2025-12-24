@@ -187,82 +187,59 @@ def pdf_to_images():
     try:
         if mode == "pages":
             # ------ MODE 1: CONVERT PDF PAGES TO IMAGES ------
-            # Use LibreOffice to convert PDF pages to images
-            # LibreOffice will create separate image files for each page
+            # Use PyMuPDF to render each PDF page as a single image
+            # This ensures one image per page, not extracting embedded images
             
-            # Determine LibreOffice export filter based on format
-            if image_format == "png":
-                export_filter = "png:writer_png_Export"
-            else:  # jpeg
-                export_filter = "jpeg:writer_jpeg_Export"
-            
-            # Build LibreOffice command
-            command = [
-                "soffice",
-                "--headless",
-                "--convert-to", export_filter,
-                "--outdir", "/tmp",
-                input_path
-            ]
-            
-            # Run LibreOffice conversion
             try:
-                subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-            except subprocess.CalledProcessError as e:
-                return jsonify({"error": "PDF to image conversion failed", "details": str(e)}), 500
-            except subprocess.TimeoutExpired:
-                return jsonify({"error": "Conversion timeout"}), 500
-            
-            # Find generated image files
-            # LibreOffice creates files like: {base_name}_0.{ext}, {base_name}_1.{ext}, etc.
-            base_name = os.path.splitext(os.path.basename(input_path))[0]
-            page_index = 0
-            
-            while True:
-                # Construct expected image file path
-                image_path = f"/tmp/{base_name}_{page_index}.{image_format}"
+                # Open PDF with PyMuPDF
+                pdf_document = fitz.open(input_path)
                 
-                if not os.path.exists(image_path):
-                    # Check if it's the first page (sometimes LibreOffice doesn't add _0)
-                    if page_index == 0:
-                        alt_path = f"/tmp/{base_name}.{image_format}"
-                        if os.path.exists(alt_path):
-                            image_path = alt_path
-                        else:
-                            break  # No more pages
-                    else:
-                        break  # No more pages
+                # Calculate zoom factor from DPI (default 150 DPI)
+                # PyMuPDF uses 72 DPI as base, so zoom = desired_dpi / 72
+                zoom = dpi / 72.0
+                mat = fitz.Matrix(zoom, zoom)
                 
-                temp_files_to_cleanup.append(image_path)
-                
-                # Read image file and get metadata
-                try:
-                    with Image.open(image_path) as img:
-                        width, height = img.size
+                # Process each page
+                for page_index in range(len(pdf_document)):
+                    page = pdf_document[page_index]
                     
-                    # Read image file and encode to base64
-                    with open(image_path, "rb") as img_file:
-                        image_data = img_file.read()
-                        base64_data = base64.b64encode(image_data).decode("utf-8")
+                    # Render page to pixmap (image)
+                    pix = page.get_pixmap(matrix=mat)
+                    
+                    # Convert pixmap to PIL Image
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    
+                    # Convert to requested format and encode to base64
+                    from io import BytesIO
+                    buffer = BytesIO()
+                    
+                    if image_format == "jpeg":
+                        # JPEG doesn't support transparency, ensure RGB mode
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+                        img.save(buffer, format="JPEG", quality=95)
+                    else:  # png
+                        img.save(buffer, format="PNG")
+                    
+                    image_bytes = buffer.getvalue()
+                    base64_data = base64.b64encode(image_bytes).decode("utf-8")
                     
                     # Add to results
                     images_result.append({
                         "index": page_index,
                         "data": base64_data,
                         "format": image_format,
-                        "width": width,
-                        "height": height
+                        "width": pix.width,
+                        "height": pix.height
                     })
-                    
-                    page_index += 1
-                    
-                except Exception as e:
-                    # Skip problematic images but continue processing
-                    page_index += 1
-                    continue
+                
+                pdf_document.close()
+                
+                if not images_result:
+                    return jsonify({"error": "No pages found in PDF"}), 500
             
-            if not images_result:
-                return jsonify({"error": "No images were generated from PDF"}), 500
+            except Exception as e:
+                return jsonify({"error": "Failed to convert PDF pages to images", "details": str(e)}), 500
         
         else:  # mode == "extract"
             # ------ MODE 2: EXTRACT EMBEDDED IMAGES FROM PDF ------
