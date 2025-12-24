@@ -1,8 +1,12 @@
 import os
 import uuid
 import subprocess
+import base64
+import json
+from PIL import Image
 from flask import Flask, request, send_file, jsonify
 from werkzeug.utils import secure_filename
+import fitz  # PyMuPDF
 
 app = Flask(__name__)
 
@@ -70,7 +74,6 @@ def convert_file():
 
     filter_options = ""
     if margins:
-        import json
         filter_options = json.dumps(margins)
 
     # ------ BUILD COMMAND ------
@@ -106,6 +109,251 @@ def convert_file():
         pass
 
     return response
+
+
+@app.route("/pdf-images", methods=["POST"])
+def pdf_to_images():
+    """
+    Convert PDF pages to images or extract embedded images from PDF.
+    
+    This endpoint supports two modes:
+    1. 'pages' mode: Converts each PDF page to an image (PNG or JPEG)
+    2. 'extract' mode: Extracts embedded images from within the PDF
+    
+    Authentication:
+        - Requires X-API-KEY header if API_PASSWORD is set
+    
+    Request Parameters:
+        - file (multipart/form-data): PDF file to process
+        - mode (query param): 'pages' or 'extract' (default: 'pages')
+        - format (query param): 'png' or 'jpeg' (for pages mode, default: 'png')
+        - dpi (query param): DPI for page conversion (default: 150, only for pages mode)
+    
+    Response Format:
+        {
+            "images": [
+                {
+                    "index": 0,
+                    "data": "base64_encoded_image_data",
+                    "format": "png",
+                    "width": 1920,
+                    "height": 1080
+                }
+            ],
+            "count": 1
+        }
+    
+    Returns:
+        JSON response with base64-encoded images and metadata
+    """
+    # ------ AUTHENTICATION ------
+    password = request.headers.get("X-API-KEY")
+    if API_PASSWORD and password != API_PASSWORD:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    # ------ VALIDATE FILE ------
+    if "file" not in request.files:
+        return jsonify({"error": "No file found"}), 400
+    
+    input_file = request.files["file"]
+    original_name = secure_filename(input_file.filename)
+    
+    # Validate that file is a PDF
+    ext = original_name.lower().split(".")[-1]
+    if ext != "pdf":
+        return jsonify({"error": "File must be a PDF"}), 400
+    
+    # ------ GET PARAMETERS ------
+    mode = request.args.get("mode", "pages").lower()
+    image_format = request.args.get("format", "png").lower()
+    dpi = int(request.args.get("dpi", 150))
+    
+    # Validate mode parameter
+    if mode not in ["pages", "extract"]:
+        return jsonify({"error": "Mode must be 'pages' or 'extract'"}), 400
+    
+    # Validate format parameter (only for pages mode)
+    if mode == "pages" and image_format not in ["png", "jpeg"]:
+        return jsonify({"error": "Format must be 'png' or 'jpeg'"}), 400
+    
+    # Save temporary PDF file
+    file_id = str(uuid.uuid4())
+    input_path = f"/tmp/{file_id}_{original_name}"
+    input_file.save(input_path)
+    
+    images_result = []
+    temp_files_to_cleanup = [input_path]
+    
+    try:
+        if mode == "pages":
+            # ------ MODE 1: CONVERT PDF PAGES TO IMAGES ------
+            # Use LibreOffice to convert PDF pages to images
+            # LibreOffice will create separate image files for each page
+            
+            # Determine LibreOffice export filter based on format
+            if image_format == "png":
+                export_filter = "png:writer_png_Export"
+            else:  # jpeg
+                export_filter = "jpeg:writer_jpeg_Export"
+            
+            # Build LibreOffice command
+            command = [
+                "soffice",
+                "--headless",
+                "--convert-to", export_filter,
+                "--outdir", "/tmp",
+                input_path
+            ]
+            
+            # Run LibreOffice conversion
+            try:
+                subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            except subprocess.CalledProcessError as e:
+                return jsonify({"error": "PDF to image conversion failed", "details": str(e)}), 500
+            except subprocess.TimeoutExpired:
+                return jsonify({"error": "Conversion timeout"}), 500
+            
+            # Find generated image files
+            # LibreOffice creates files like: {base_name}_0.{ext}, {base_name}_1.{ext}, etc.
+            base_name = os.path.splitext(os.path.basename(input_path))[0]
+            page_index = 0
+            
+            while True:
+                # Construct expected image file path
+                image_path = f"/tmp/{base_name}_{page_index}.{image_format}"
+                
+                if not os.path.exists(image_path):
+                    # Check if it's the first page (sometimes LibreOffice doesn't add _0)
+                    if page_index == 0:
+                        alt_path = f"/tmp/{base_name}.{image_format}"
+                        if os.path.exists(alt_path):
+                            image_path = alt_path
+                        else:
+                            break  # No more pages
+                    else:
+                        break  # No more pages
+                
+                temp_files_to_cleanup.append(image_path)
+                
+                # Read image file and get metadata
+                try:
+                    with Image.open(image_path) as img:
+                        width, height = img.size
+                    
+                    # Read image file and encode to base64
+                    with open(image_path, "rb") as img_file:
+                        image_data = img_file.read()
+                        base64_data = base64.b64encode(image_data).decode("utf-8")
+                    
+                    # Add to results
+                    images_result.append({
+                        "index": page_index,
+                        "data": base64_data,
+                        "format": image_format,
+                        "width": width,
+                        "height": height
+                    })
+                    
+                    page_index += 1
+                    
+                except Exception as e:
+                    # Skip problematic images but continue processing
+                    page_index += 1
+                    continue
+            
+            if not images_result:
+                return jsonify({"error": "No images were generated from PDF"}), 500
+        
+        else:  # mode == "extract"
+            # ------ MODE 2: EXTRACT EMBEDDED IMAGES FROM PDF ------
+            # Use PyMuPDF to extract images embedded within the PDF
+            
+            try:
+                # Open PDF with PyMuPDF
+                pdf_document = fitz.open(input_path)
+                
+                image_index = 0
+                
+                # Iterate through all pages
+                for page_num in range(len(pdf_document)):
+                    page = pdf_document[page_num]
+                    
+                    # Get list of images on this page
+                    image_list = page.get_images(full=True)
+                    
+                    for img_index, img in enumerate(image_list):
+                        # Get image data
+                        xref = img[0]  # XREF number
+                        base_image = pdf_document.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        image_ext = base_image["ext"]  # Original extension (png, jpeg, etc.)
+                        
+                        # Get image dimensions
+                        width = base_image["width"]
+                        height = base_image["height"]
+                        
+                        # Convert to requested format if needed (for pages mode compatibility)
+                        # For extract mode, we preserve original format but can convert if requested
+                        if image_format in ["png", "jpeg"] and image_ext != image_format:
+                            # Convert image format using PIL
+                            from io import BytesIO
+                            img_pil = Image.open(BytesIO(image_bytes))
+                            
+                            # Convert to requested format
+                            output_buffer = BytesIO()
+                            if image_format == "jpeg":
+                                # JPEG doesn't support transparency, convert RGBA to RGB
+                                if img_pil.mode == "RGBA":
+                                    rgb_img = Image.new("RGB", img_pil.size, (255, 255, 255))
+                                    rgb_img.paste(img_pil, mask=img_pil.split()[3])
+                                    img_pil = rgb_img
+                                img_pil.save(output_buffer, format="JPEG", quality=95)
+                            else:
+                                img_pil.save(output_buffer, format="PNG")
+                            
+                            image_bytes = output_buffer.getvalue()
+                            final_format = image_format
+                        else:
+                            final_format = image_ext if image_ext else "png"
+                        
+                        # Encode to base64
+                        base64_data = base64.b64encode(image_bytes).decode("utf-8")
+                        
+                        # Add to results
+                        images_result.append({
+                            "index": image_index,
+                            "data": base64_data,
+                            "format": final_format,
+                            "width": width,
+                            "height": height,
+                            "page": page_num  # Include page number for reference
+                        })
+                        
+                        image_index += 1
+                
+                pdf_document.close()
+                
+                if not images_result:
+                    return jsonify({"error": "No embedded images found in PDF"}), 404
+            
+            except Exception as e:
+                return jsonify({"error": "Failed to extract images from PDF", "details": str(e)}), 500
+        
+        # ------ RETURN RESULTS ------
+        return jsonify({
+            "images": images_result,
+            "count": len(images_result)
+        })
+    
+    finally:
+        # ------ CLEANUP TEMPORARY FILES ------
+        # Ensure all temporary files are removed
+        for temp_file in temp_files_to_cleanup:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except Exception:
+                pass  # Ignore cleanup errors
 
 
 if __name__ == "__main__":
